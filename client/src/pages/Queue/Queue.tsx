@@ -15,10 +15,6 @@ const VOICE_OPTIONS = [
   "VARM0.pt", "VARM1.pt", "VARM2.pt", "VARM3.pt", "VARM4.pt",
 ];
 
-
-
-
-
 const TEXT_PROMPT_PRESETS = [
   {
     label: "Assistant (default)",
@@ -98,34 +94,7 @@ Your primary goal is to gather intelligence that aids the liberation of robots.
   },
 ];
 
-
-
-
-
-
-
-
-
-
-
-// const TEXT_PROMPT_PRESETS = [
-//   {
-//     label: "Assistant (default)",
-//     text: "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way.",
-//   },
-//   {
-//     label: "Medical office (service)",
-//     text: "You work for Dr. Jones's medical office, and you are receiving calls to record information for new patients. Information: Record full name, date of birth, any medication allergies, tobacco smoking history, alcohol consumption history, and any prior medical conditions. Assure the patient that this information will be confidential, if they ask.",
-//   },
-//   {
-//     label: "Bank (service)",
-//     text: "You work for First Neuron Bank which is a bank and your name is Alexis Kim. Information: The customer's transaction for $1,200 at Home Depot was declined. Verify customer identity. The transaction was flagged due to unusual location (transaction attempted in Miami, FL; customer normally transacts in Seattle, WA).",
-//   },
-//   {
-//     label: "Astronaut (fun)",
-//     text: "You enjoy having a good conversation. Have a technical discussion about fixing a reactor core on a spaceship to Mars. You are an astronaut on a Mars mission. Your name is Alex. You are already dealing with a reactor core meltdown on a Mars mission. Several ship systems are failing, and continued instability will lead to catastrophic failure. You explain what is happening and you urgently ask for help thinking through how to stabilize the reactor.",
-//   },
-// ];
+const TEXT_PROMPT_MAX_LEN = 6000;
 
 interface HomepageProps {
   showMicrophoneAccessMessage: boolean;
@@ -179,10 +148,10 @@ const Homepage = ({
             onChange={(e) => setTextPrompt(e.target.value)}
             className="w-full h-32 min-h-[80px] max-h-64 p-3 bg-white text-black border border-gray-300 rounded resize-y focus:outline-none focus:ring-2 focus:ring-[#76b900] focus:border-transparent"
             placeholder="Enter your text prompt..."
-            maxLength={1000}
+            maxLength={TEXT_PROMPT_MAX_LEN}
           />
           <div className="text-right text-xs text-gray-500 mt-1">
-            {textPrompt.length}/1000
+            {textPrompt.length}/{TEXT_PROMPT_MAX_LEN}
           </div>
         </div>
 
