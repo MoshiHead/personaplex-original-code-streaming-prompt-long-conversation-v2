@@ -275,6 +275,11 @@ def run_inference(
         steps = user_encoded.shape[-1]
         for c in range(steps):
             step_in = user_encoded[:, :, c : c + 1]
+            # Refresh the sliding attention window before it overflows, otherwise the
+            # prompt scrolls out of context and the model degenerates into silence.
+            if lm_gen.needs_context_refresh():
+                log("info", "context window nearly full; refreshing")
+                lm_gen.context_refresh()
             # Feed user-side input channels; text + agent audio are sampled
             tokens = lm_gen.step(step_in)
             if tokens is None:

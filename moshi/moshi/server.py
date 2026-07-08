@@ -96,7 +96,8 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False,
+                 context_refresh_history_sec: float = 20.0):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -109,6 +110,7 @@ class ServerState:
                             device=device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+                            context_refresh_history_sec=context_refresh_history_sec,
         )
         
         self.lock = asyncio.Lock()
@@ -240,6 +242,17 @@ class ServerState:
                             await ws.send_bytes(msg)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    # The backbone attends over a sliding window of `context` steps; once
+                    # the prompt scrolls out of that window the model degenerates into
+                    # permanent silence. Refresh the context (prompts + recent history)
+                    # shortly before the window overflows.
+                    if self.lm_gen.needs_context_refresh():
+                        offset = self.lm_gen._streaming_state.offset
+                        clog.log("info", f"context window nearly full (offset={offset}); refreshing")
+                        refresh_start = time.time()
+                        await self.lm_gen.context_refresh_async()
+                        clog.log("info", f"context refresh done in {time.time() - refresh_start:.1f}s "
+                                         f"(new offset={self.lm_gen._streaming_state.offset})")
 
         async def send_loop():
             while True:
@@ -383,6 +396,18 @@ def main():
         )
     )
     parser.add_argument(
+        "--context-refresh-history-sec",
+        type=float,
+        default=20.0,
+        help=(
+            "Seconds of recent conversation replayed when the model's sliding attention "
+            "window (context) is about to overflow. The refresh keeps long conversations "
+            "alive past the ~4 minute context limit at the cost of a short processing "
+            "pause. Set to 0 to disable (the model will go permanently silent a couple "
+            "of minutes after the prompt scrolls out of its context window)."
+        ),
+    )
+    parser.add_argument(
         "--ssl",
         type=str,
         help=(
@@ -453,6 +478,7 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        context_refresh_history_sec=args.context_refresh_history_sec,
     )
     logger.info("warming up the model")
     state.warmup()

@@ -29,6 +29,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -661,6 +662,8 @@ class LMGen(StreamingModule[_LMGenState]):
         save_voice_prompt_embeddings: bool = False,
         sample_rate: int = 32000,
         frame_rate: int = FRAME_RATE_HZ,
+        context_refresh_margin: int = 16,
+        context_refresh_history_sec: float = 20.0,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -698,6 +701,21 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
+        # Rolling context refresh: the backbone attends over a sliding window of
+        # `lm_model.context` steps (a ring KV cache). Once the total stream offset exceeds
+        # that window, the system/voice prompt scrolls out of the model's attention and the
+        # model soon degenerates into permanent silence (PAD text + silence audio). To keep
+        # long conversations alive, we record the last `context_refresh_history_sec` seconds
+        # of aligned (text, agent-audio, user-audio) token frames and, shortly before the
+        # window overflows, rebuild the KV cache from scratch: prompts + recent history.
+        self.context_refresh_margin = context_refresh_margin
+        self.context_refresh_history_sec = context_refresh_history_sec
+        self._record_history = False
+        self._hist: Optional[torch.Tensor] = None
+        self._hist_capacity = 0
+        self._hist_len = 0
+        self._hist_next = 0
+        self._post_prompt_offset = 0
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -950,6 +968,7 @@ class LMGen(StreamingModule[_LMGenState]):
         out = state.cache.gather(dim=2, index=index)
 
         state.offset += 1
+        self._record_frame(out)
         if self.report_loss:
             return out, report
         elif self.return_logits and not self.report_loss:
@@ -1016,9 +1035,9 @@ class LMGen(StreamingModule[_LMGenState]):
             moshi_tokens=voice_prompt_frame_tokens,
             text_token=self.zero_text_code,
             input_tokens=self._encode_sine_frame(),
-            return_embeddings=self.save_voice_prompt_embeddings,
+            return_embeddings=saved_embeddings is not None,
         )
-        if out is not None and self.save_voice_prompt_embeddings:
+        if out is not None and saved_embeddings is not None:
             _, embeddings = out
             saved_embeddings.append(embeddings)
 
@@ -1049,16 +1068,22 @@ class LMGen(StreamingModule[_LMGenState]):
             # One last checkpoint before any optional save (nice-to-have for async disconnect)
             yield
 
-            if self.save_voice_prompt_embeddings:
+            if saved_embeddings:
+                # Retain the embeddings in memory so that mid-conversation context refreshes
+                # can replay the voice prompt without touching the (busy) mimi encoder.
                 # Offset int(self._streaming_state.offset) is not needed since calling step() for len(voice_prompt_frame_tokens)
                 # and calling step_embeddings() for len(voice_prompt_embeddings) will increment offset by the same amount
-                torch.save(
-                    {
-                        "embeddings": torch.stack(saved_embeddings, dim=0).detach().cpu(),
-                        "cache": self._streaming_state.cache
-                    },
-                    splitext(self.voice_prompt)[0] + ".pt",
-                )
+                stacked = torch.stack(saved_embeddings, dim=0)
+                self.voice_prompt_embeddings = stacked
+                self.voice_prompt_cache = self._streaming_state.cache.clone()
+                if self.save_voice_prompt_embeddings:
+                    torch.save(
+                        {
+                            "embeddings": stacked.detach().cpu(),
+                            "cache": self._streaming_state.cache
+                        },
+                        splitext(self.voice_prompt)[0] + ".pt",
+                    )
         print('Done loading voice prompt.')
 
     def _step_voice_prompt(self, mimi):
@@ -1094,7 +1119,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     def _step_text_prompt_core(self) -> Iterator[None]:
-        for text_prompt_token in self.text_prompt_tokens:
+        for text_prompt_token in (self.text_prompt_tokens or []):
             yield
             self.step(
                 moshi_tokens=self._encode_zero_frame(),
@@ -1119,12 +1144,148 @@ class LMGen(StreamingModule[_LMGenState]):
         await self._step_audio_silence_async(is_alive)
         await self._step_text_prompt_async(is_alive)
         await self._step_audio_silence_async(is_alive)
+        self._enable_history_recording()
 
     def step_system_prompts(self, mimi):
         self._step_voice_prompt(mimi)
         self._step_audio_silence()
         self._step_text_prompt()
         self._step_audio_silence()
+        self._enable_history_recording()
+
+    def reset_streaming(self):
+        super().reset_streaming()
+        # A fresh stream invalidates the recorded conversation history.
+        self._record_history = False
+        self._hist_len = 0
+        self._hist_next = 0
+
+    def _record_frame(self, out: torch.Tensor) -> None:
+        """Record one aligned output frame (text + agent audio + forced user audio tokens)
+        into the rolling history ring used for context refreshes.
+
+        `out` is the [B, dep_q + 1, 1] frame returned by `process_transformer_output`;
+        rows 1..8 are the agent (moshi) audio codebooks and rows 9..16 hold the user audio
+        codebooks, which contain the *forced* (real) user tokens since they were provided.
+        """
+        if not self._record_history or self._hist_capacity <= 0:
+            return
+        if self._hist is None or self._hist.shape[1] != self._hist_capacity:
+            self._hist = torch.zeros(
+                out.shape[1], self._hist_capacity, dtype=torch.long, device=out.device
+            )
+        self._hist[:, self._hist_next] = out[0, :, 0]
+        self._hist_next = (self._hist_next + 1) % self._hist_capacity
+        self._hist_len = min(self._hist_len + 1, self._hist_capacity)
+
+    def _snapshot_history(self) -> Optional[torch.Tensor]:
+        """Return the recorded frames as a [dep_q + 1, T] tensor, oldest first."""
+        if self._hist is None or self._hist_len == 0:
+            return None
+        if self._hist_len < self._hist_capacity:
+            return self._hist[:, : self._hist_len].clone()
+        return torch.cat(
+            [self._hist[:, self._hist_next:], self._hist[:, : self._hist_next]], dim=1
+        )
+
+    def _enable_history_recording(self) -> None:
+        """Start recording conversation frames; called once the prompts are fully loaded.
+
+        Sizes the history ring so that `prompts + history + margin` always fits inside the
+        backbone context window, guaranteeing that a refresh moves the offset safely away
+        from the overflow threshold.
+        """
+        state = self._streaming_state
+        if state is None:
+            return
+        self._post_prompt_offset = state.offset
+        context = self.lm_model.context
+        if context is None:
+            self._hist_capacity = 0
+            return
+        budget = context - self.context_refresh_margin - self._post_prompt_offset \
+            - 2 * (self.max_delay + 3)
+        configured = int(self.context_refresh_history_sec * self._frame_rate)
+        self._hist_capacity = max(0, min(configured, budget))
+        if configured > 0 and self._hist_capacity <= 0:
+            logger.warning(
+                "context refresh disabled: prompts alone occupy the context window "
+                "(post-prompt offset %d of context %d). Shorten the text/voice prompt.",
+                self._post_prompt_offset, context,
+            )
+        self._hist_len = 0
+        self._hist_next = 0
+        self._record_history = True
+
+    def needs_context_refresh(self) -> bool:
+        """True when the stream offset is about to exceed the backbone attention window."""
+        state = self._streaming_state
+        if state is None or not self._record_history or self._hist_capacity <= 0:
+            return False
+        context = self.lm_model.context
+        if context is None:
+            return False
+        return state.offset >= context - self.context_refresh_margin
+
+    def _context_refresh_core(self) -> Iterator[None]:
+        """Rebuild the streaming state before the ring KV cache overflows the trained window.
+
+        Sequence: snapshot recent history -> reset all streaming state -> replay voice
+        prompt (from retained embeddings; no mimi needed) -> silence -> text prompt ->
+        silence -> teacher-force the recorded conversation history back in. Yields at each
+        step so async callers can keep the event loop responsive.
+        """
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError(
+                "You should wrap those calls with a `with lm_gen.streaming(): ...`."
+            )
+        if self.voice_prompt_audio is not None and self.voice_prompt_embeddings is None:
+            # Should not happen: embeddings are retained when the wav prompt is first
+            # stepped. Refuse to refresh rather than corrupt the live mimi encoder.
+            logger.warning("context refresh skipped: no retained voice prompt embeddings.")
+            self._hist_capacity = 0
+            return
+        history = self._snapshot_history()
+        prev_offset = state.offset
+        self.reset_streaming()
+        for _ in self._step_voice_prompt_core(mimi=None):
+            yield
+        for _ in self._step_audio_silence_core():
+            yield
+        for _ in self._step_text_prompt_core():
+            yield
+        for _ in self._step_audio_silence_core():
+            yield
+        # Re-enable recording before the replay so the replayed frames repopulate the ring.
+        self._enable_history_recording()
+        if history is not None:
+            needed = self.lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
+            for i in range(history.shape[1]):
+                yield
+                frame = history[:, i]
+                self.step(
+                    input_tokens=frame[1 + needed: 1 + 2 * needed].reshape(1, needed, 1),
+                    moshi_tokens=frame[1: 1 + needed].reshape(1, needed, 1),
+                    text_token=frame[0],
+                )
+        logger.info(
+            "context refresh done: offset %d -> %d (replayed %d history frames)",
+            prev_offset, self._streaming_state.offset,
+            0 if history is None else history.shape[1],
+        )
+
+    def context_refresh(self):
+        for _ in self._context_refresh_core():
+            pass
+
+    async def context_refresh_async(self, yield_every: int = 8):
+        cnt = 0
+        for _ in self._context_refresh_core():
+            cnt += 1
+            if cnt % yield_every == 0:
+                # Let the websocket send/recv loops breathe between GPU steps.
+                await asyncio.sleep(0)
 
     def depformer_step(
         self,
